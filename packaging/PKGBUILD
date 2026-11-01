@@ -1,0 +1,27 @@
+pkgname=cava-bar-theme
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Wayland audio visualizer and automatic wallpaper theme'
+arch=('any')
+license=('MIT')
+depends=('bash' 'python' 'python-gobject' 'gtk4' 'cava' 'jq' 'libnotify' 'ffmpeg' 'playerctl')
+optdepends=('imagemagick: GIF colour extraction'
+            'mpvpaper: animated wallpapers'
+            'matugen: automatic application theming')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  install -dm755 "$pkgdir/usr/share/$pkgname"
+  cp -a bin config demo gnome-extension templates README.md LICENSE install.sh \
+    "$pkgdir/usr/share/$pkgname/"
+
+  install -dm755 "$pkgdir/usr/bin"
+  cat > "$pkgdir/usr/bin/cava-bar-install" <<'EOF'
+#!/bin/sh
+exec /usr/share/cava-bar-theme/install.sh "$@"
+EOF
+  chmod 755 "$pkgdir/usr/bin/cava-bar-install"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

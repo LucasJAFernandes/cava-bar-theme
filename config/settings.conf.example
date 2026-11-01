@@ -1,0 +1,13 @@
+wallpaper_dir=~/Pictures/Wallpapers
+order=sequential
+mode=dark
+theme=on
+# Color: auto = from wallpaper, fixed = manual, music = music cover
+color_mode=auto
+contrast=high
+animated=mpvpaper
+pause_on_battery=true
+backend=auto
+disabled_templates=
+show_audio_status=true
+player=

@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""GTK4 settings window for cava-bar-theme.
+
+Edits two text files (you can also edit them manually):
+  ~/.config/cava-bar/style.conf        aspeto do visualizador (aplicado ao vivo)
+  ~/.config/cava-bar-theme/config      wallpaper, tema e sistema
+"""
+import os, re, sys, shutil, subprocess
+
+HOME = os.path.expanduser("~")
+STYLE_FILE = f"{HOME}/.config/cava-bar/style.conf"
+CONFIG_FILE = f"{HOME}/.config/cava-bar-theme/config"
+MATUGEN_CFG = f"{HOME}/.config/matugen/config.toml"
+AUTOSTART_DIR = f"{HOME}/.config/autostart"
+SELF_DIR = os.path.dirname(os.path.realpath(__file__))
+GNOME_EXTENSION_ID = "cava-bar@local"
+
+STYLE_DEFAULTS = {
+    "style": "rounded", "color": "#FF0000", "color2": "#FF0000", "gradient": "false",
+    "opacity": "0.85", "gap": "4", "height": "180", "bars": "64", "silence": "2",
+}
+CONFIG_DEFAULTS = {
+    "wallpaper_dir": "~/Pictures/Wallpapers", "order": "sequential", "mode": "dark",
+    "theme": "on", "color_mode": "auto", "animated": "mpvpaper",
+    "pause_on_battery": "true", "backend": "auto", "disabled_templates": "",
+    "show_audio_status": "true", "player": "",
+}
+
+
+# ------------------------------------------------------------ files ----
+def read_kv(path, defaults):
+    data = dict(defaults)
+    try:
+        with open(path) as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                data[k.strip()] = v.strip().strip('"')
+    except OSError:
+        pass
+    return data
+
+
+def write_kv(path, updates):
+    """Updates only the given keys, preserving comments and the rest of the file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    remaining = dict(updates)
+    out = []
+    for line in lines:
+        m = re.match(r"^\s*([A-Za-z0-9_]+)\s*=", line)
+        if m and m.group(1) in remaining:
+            out.append(f"{m.group(1)}={remaining.pop(m.group(1))}")
+        else:
+            out.append(line)
+    for k, v in remaining.items():
+        out.append(f"{k}={v}")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(out) + "\n")
+    os.replace(tmp, path)
+
+
+def find_bin(name):
+    for d in (SELF_DIR, f"{HOME}/.local/bin"):
+        p = os.path.join(d, name)
+        if os.access(p, os.X_OK):
+            return p
+    return shutil.which(name)
+
+
+def list_templates():
+    try:
+        with open(MATUGEN_CFG) as f:
+            return re.findall(r"(?m)^\[templates\.([^\].\s]+)\]", f.read())
+    except OSError:
+        return []
+
+
+def to_bool(v):
+    return str(v).strip().lower() in ("1", "true", "on", "yes")
+
+
+def from_bool(b):
+    return "true" if b else "false"
+
+
+def to_float(v, default):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def autostart_enabled():
+    if is_gnome_session():
+        return os.path.exists(f"{AUTOSTART_DIR}/cava-bar-wallpaper.desktop")
+    return os.path.exists(f"{AUTOSTART_DIR}/cava-bar.desktop")
+
+
+def is_gnome_session():
+    desktop = f"{os.environ.get('XDG_CURRENT_DESKTOP', '')}:{os.environ.get('XDG_SESSION_DESKTOP', '')}"
+    return "gnome" in desktop.lower()
+
+
+def set_autostart(on):
+    if is_gnome_session():
+        extension = shutil.which("gnome-extensions")
+        if extension:
+            action = "enable" if on else "disable"
+            subprocess.run([extension, action, GNOME_EXTENSION_ID], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        entries = {
+            "cava-bar-wallpaper.desktop": ("cava-bar wallpaper",
+                                            (find_bin("next-wallpaper") or "next-wallpaper") + " restore"),
+        }
+    else:
+        entries = {
+            "cava-bar.desktop": ("cava-bar", find_bin("cava-bar") or "cava-bar"),
+            "cava-nowplaying.desktop": ("cava-nowplaying",
+                                        find_bin("cava-nowplaying") or "cava-nowplaying"),
+            "cava-bar-wallpaper.desktop": ("cava-bar wallpaper",
+                                           (find_bin("next-wallpaper") or "next-wallpaper") + " restore"),
+        }
+    for fname, (name, exec_) in entries.items():
+        path = f"{AUTOSTART_DIR}/{fname}"
+        if on:
+            os.makedirs(AUTOSTART_DIR, exist_ok=True)
+            with open(path, "w") as f:
+                f.write("[Desktop Entry]\nType=Application\n"
+                        f"Name={name}\nExec={exec_}\nX-GNOME-Autostart-Delay=3\n")
+        else:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+# --- GTK ---------------------------------------------------------------
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, GLib, Gdk
+
+STYLES = [("rounded", "Barras arredondadas"), ("bars", "Barras"),
+          ("wave", "Onda preenchida"), ("line", "Linha"), ("dots", "Pontos")]
+ORDERS = [("sequential", "Sequential (by name)"), ("random", "Random")]
+MODES = [("dark", "Escuro"), ("light", "Claro")]
+COLOR_MODES = [
+    ("auto", "Automatic (from wallpaper)"),
+    ("fixed", "Fixed (the one you choose)"),
+    ("music", "Music colour"),
+]
+ANIMATED = [("mpvpaper", "Animar (mpvpaper)"), ("frame", "Only the first frame")]
+BACKENDS = [("auto", "Automatic"), ("cosmic", "COSMIC"), ("swww", "swww"),
+            ("swaybg", "swaybg"), ("hyprpaper", "hyprpaper"), ("gnome", "GNOME"),
+            ("none", "None (theme only)")]
+
+
+def rgba_to_hex(rgba):
+    return "#%02X%02X%02X" % tuple(round(c * 255) for c in (rgba.red, rgba.green, rgba.blue))
+
+
+class Store:
+    """Saves changes with a small delay, to avoid writing every pixel."""
+
+    def __init__(self, on_status):
+        self.style = read_kv(STYLE_FILE, STYLE_DEFAULTS)
+        self.config = read_kv(CONFIG_FILE, CONFIG_DEFAULTS)
+        self.on_status = on_status
+        self._ps, self._pc, self._timer = {}, {}, 0
+        self.style_mtime = self._mtime()
+
+    def _mtime(self):
+        try:
+            return os.path.getmtime(STYLE_FILE)
+        except OSError:
+            return 0.0
+
+    def set_style(self, k, v):
+        self.style[k] = str(v)
+        self._ps[k] = str(v)
+        self._schedule()
+
+    def set_config(self, k, v):
+        self.config[k] = str(v)
+        self._pc[k] = str(v)
+        self._schedule()
+
+    def _schedule(self):
+        if self._timer:
+            GLib.source_remove(self._timer)
+        self._timer = GLib.timeout_add(250, self.flush)
+
+    def flush(self):
+        if self._timer:
+            GLib.source_remove(self._timer)
+            self._timer = 0
+        try:
+            if self._ps:
+                write_kv(STYLE_FILE, self._ps)
+                self._ps = {}
+                self.style_mtime = self._mtime()
+            if self._pc:
+                write_kv(CONFIG_FILE, self._pc)
+                self._pc = {}
+            self.on_status("Guardado")
+        except OSError as e:
+            self.on_status(f"Erro ao guardar: {e}")
+        return GLib.SOURCE_REMOVE
+
+    def pending(self):
+        return bool(self._ps or self._pc)
+
+
+# ------------------------------------------------------- widgets ----------
+def row(label, widget, hint=None):
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+    line.append(Gtk.Label(label=label, xalign=0, hexpand=True))
+    line.append(widget)
+    box.append(line)
+    if hint:
+        h = Gtk.Label(label=hint, xalign=0, wrap=True)
+        h.add_css_class("dim-label")
+        box.append(h)
+    return box
+
+
+def note(text):
+    lab = Gtk.Label(label=text, xalign=0, wrap=True)
+    lab.add_css_class("dim-label")
+    return lab
+
+
+def page(*rows):
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin_top=16,
+                  margin_bottom=16, margin_start=16, margin_end=16)
+    for r in rows:
+        box.append(r)
+    sw = Gtk.ScrolledWindow(vexpand=True)
+    sw.set_child(box)
+    return sw
+
+
+def dropdown(options, current, on_change):
+    keys = [k for k, _ in options]
+    dd = Gtk.DropDown(model=Gtk.StringList.new([l for _, l in options]), valign=Gtk.Align.CENTER)
+    dd.set_selected(keys.index(current) if current in keys else 0)
+    dd.connect("notify::selected", lambda d, _p: on_change(keys[d.get_selected()]))
+    return dd
+
+
+def slider(lo, hi, step, value, digits, on_change):
+    s = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
+    s.set_digits(digits)
+    s.set_draw_value(True)
+    s.set_value_pos(Gtk.PositionType.RIGHT)
+    s.set_size_request(240, -1)
+    s.set_value(value)
+    s.connect("value-changed", lambda w: on_change(w.get_value()))
+    return s
+
+
+def spin(lo, hi, step, value, digits, on_change):
+    b = Gtk.SpinButton.new_with_range(lo, hi, step)
+    b.set_digits(digits)
+    b.set_value(value)
+    b.set_valign(Gtk.Align.CENTER)
+    b.connect("value-changed", lambda w: on_change(w.get_value()))
+    return b
+
+
+def switch(active, on_change):
+    s = Gtk.Switch(valign=Gtk.Align.CENTER)
+    s.set_active(active)
+    s.connect("notify::active", lambda w, _p: on_change(w.get_active()))
+    return s
+
+
+def color_button(initial, on_change):
+    rgba = Gdk.RGBA()
+    if not rgba.parse(initial):
+        rgba.parse("#FF0000")
+    if hasattr(Gtk, "ColorDialogButton"):
+        btn = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(), valign=Gtk.Align.CENTER)
+        btn.set_rgba(rgba)
+        btn.connect("notify::rgba", lambda b, _p: on_change(rgba_to_hex(b.get_rgba())))
+    else:
+        btn = Gtk.ColorButton.new_with_rgba(rgba)
+        btn.set_valign(Gtk.Align.CENTER)
+        btn.connect("color-set", lambda b: on_change(rgba_to_hex(b.get_rgba())))
+    return btn
+
+
+class SettingsWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Cava Bar Theme")
+        self.set_default_size(620, 700)
+        self._loading = False
+        self._chooser = None
+        self.store = Store(self.set_status)
+        st, cf = self.store.style, self.store.config
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        nb = Gtk.Notebook(vexpand=True)
+        outer.append(nb)
+
+        # ---- Visualizer
+        nb.append_page(page(
+            row("Estilo", dropdown(STYLES, st["style"], lambda v: self.store.set_style("style", v))),
+            row("Opacidade", slider(0.1, 1.0, 0.05, to_float(st["opacity"], 0.85), 2,
+                                    lambda v: self.store.set_style("opacity", round(v, 2)))),
+            row("Bar gap (px)", slider(0, 20, 1, to_float(st["gap"], 4), 0,
+                                                   lambda v: self.store.set_style("gap", int(v)))),
+            row("Hide after silence (seconds)",
+                spin(0.5, 60, 0.5, to_float(st["silence"], 2), 1,
+                     lambda v: self.store.set_style("silence", round(v, 1)))),
+            row("Altura (px)", spin(40, 1000, 10, to_float(st["height"], 180), 0,
+                                    lambda v: self._restart_needed("height", int(v))),
+                "Applies on restart of the visualizer."),
+            row("Number of bars", spin(8, 256, 1, to_float(st["bars"], 64), 0,
+                                         lambda v: self._restart_needed("bars", int(v))),
+                "Applies on restart of the visualizer."),
+            row("Show «Now playing»",
+                switch(to_bool(cf["show_audio_status"]),
+                       lambda v: self.store.set_config("show_audio_status", from_bool(v))),
+                "Shows the cover, title and progress bar of the music in the top-right corner "
+                "on the live."),
+            row("Music player (optional)", self._player_entry(cf["player"]),
+                "Empty. Examples: spotify, firefox, vlc. "
+                "Shows the names with `playerctl -l`."),
+        ), Gtk.Label(label="Visualizer"))
+
+        # ---- Color
+        self.color1 = color_button(st["color"], lambda v: self._color("color", v))
+        self.color2 = color_button(st["color2"], lambda v: self._color("color2", v))
+        nb.append_page(page(
+            row("Colour origin", dropdown(COLOR_MODES, cf["color_mode"],
+                                          lambda v: self.store.set_config("color_mode", v)),
+                "Automatic: the colour changes on its own with each wallpaper and the system theme follows the colour of the bars. "
+                "Fixed: keeps the colours you choose below. "
+                "Music colour: uses the dominant colour of the cover of the currently playing music."),
+            row("Cor principal", self.color1),
+            row("Use gradient (from main colour to colour 2)",
+                switch(to_bool(st["gradient"]),
+                       lambda v: self.store.set_style("gradient", from_bool(v)))),
+            row("Cor 2 (topo das barras)", self.color2),
+        ), Gtk.Label(label="Color"))
+
+        # ---- Wallpaper
+        self.dir_entry = Gtk.Entry(text=cf["wallpaper_dir"], hexpand=True, width_chars=28)
+        self.dir_entry.connect("changed", lambda e: self.store.set_config("wallpaper_dir", e.get_text()))
+        pick = Gtk.Button(label="Choose…")
+        pick.connect("clicked", lambda _b: self._choose_folder())
+        dir_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        dir_box.append(self.dir_entry)
+        dir_box.append(pick)
+        nb.append_page(page(
+            row("Pasta dos wallpapers", dir_box,
+                "Aceita .jpg, .png, .webp, .gif, .mp4, .webm, .mkv e .mov. "
+                "A ordem sequencial segue o nome dos ficheiros."),
+            row("Ordem", dropdown(ORDERS, cf["order"], lambda v: self.store.set_config("order", v))),
+            row("Modo do tema", dropdown(MODES, cf["mode"], lambda v: self.store.set_config("mode", v))),
+            row("GIF and videos", dropdown(ANIMATED, cf["animated"],
+                                         lambda v: self.store.set_config("animated", v)),
+                "To animate you need mpvpaper. Without it, only the first frame is used."),
+            row("Pause animation when on battery",
+                switch(to_bool(cf["pause_on_battery"]),
+                       lambda v: self.store.set_config("pause_on_battery", from_bool(v))),
+                "See in the next wallpaper when you change it while on laptop battery."),
+            row("Method to change the wallpaper", dropdown(BACKENDS, cf["backend"],
+                                                          lambda v: self.store.set_config("backend", v))),
+        ), Gtk.Label(label="Wallpaper"))
+
+        # ---- Theme
+        disabled = {x for x in cf["disabled_templates"].split(",") if x}
+        self._disabled = disabled
+        rows = [row("Gerar tema das apps com o matugen",
+                    switch(to_bool(cf["theme"]), lambda v: self.store.set_config("theme", from_bool(v))),
+                    "Off: only the viewer colour changes.")]
+        tpls = list_templates()
+        if tpls:
+            rows.append(Gtk.Label(label="Templates (apps to theme)", xalign=0))
+            for name in tpls:
+                cb = Gtk.CheckButton(label=name)
+                cb.set_active(name not in disabled)
+                cb.connect("toggled", self._tpl_toggled, name)
+                rows.append(cb)
+        else:
+            rows.append(note(f"Nenhum template em {MATUGEN_CFG}."))
+        rows.append(note("To tematize more apps, add a [templates.name] block to "
+                         "config.toml of matugen. After you change here, load "
+                         "«Apply theme now»."))
+        nb.append_page(page(*rows), Gtk.Label(label="Theme"))
+
+        # ---- System
+        self.autostart = switch(autostart_enabled(), self._toggle_autostart)
+        tools = []
+        for label, names in (("cava", ("cava",)), ("matugen", ("matugen",)), ("jq", ("jq",)),
+                             ("mpvpaper (GIF/video)", ("mpvpaper",)), ("ffmpeg (videos)", ("ffmpeg",)),
+                             ("ImageMagick (GIF)", ("magick", "convert")), ("pactl (audio)", ("pactl",)),
+                             ("playerctl (Now playing)", ("playerctl",))):
+            ok = any(shutil.which(n) for n in names)
+            tools.append(f"{'OK  ' if ok else 'MISSING  '} {label}")
+        nb.append_page(page(
+            row("Start with session", self.autostart,
+                "Cria entradas em ~/.config/autostart. No Hyprland/Sway usa o ficheiro do compositor."),
+            Gtk.Label(label="Tools", xalign=0),
+            Gtk.Label(label="\n".join(tools), xalign=0, selectable=True),
+            note(f"Configuration files:\n{STYLE_FILE}\n{CONFIG_FILE}"),
+        ), Gtk.Label(label="System"))
+
+        # ---- Action bar
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_top=8,
+                      margin_bottom=8, margin_start=12, margin_end=12)
+        for label, action in (("Previous", "prev"), ("Next ⏭", "next")):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", lambda _b, a=action: self.run_wallpaper(a))
+            bar.append(b)
+        b = Gtk.Button(label="Apply theme now")
+        b.connect("clicked", lambda _b: self.run_wallpaper("reapply"))
+        bar.append(b)
+        self.restart_btn = Gtk.Button(label="Restart visualizer", hexpand=True, halign=Gtk.Align.END)
+        self.restart_btn.connect("clicked", lambda _b: self.restart_visualizer())
+        bar.append(self.restart_btn)
+        outer.append(bar)
+
+        self.status = Gtk.Label(label="", xalign=0, margin_start=12, margin_bottom=8)
+        self.status.add_css_class("dim-label")
+        outer.append(self.status)
+
+        self.set_child(outer)
+        GLib.timeout_add_seconds(2, self._poll_colors)
+        self.connect("close-request", self._on_close)
+
+    # ---------------------------------------------------------- actions ----
+    def set_status(self, text):
+        self.status.set_text(text)
+
+    def _player_entry(self, current):
+        e = Gtk.Entry(text=current, width_chars=16, valign=Gtk.Align.CENTER)
+        e.connect("changed", lambda w: self.store.set_config("player", w.get_text().strip()))
+        return e
+
+    def _restart_needed(self, key, value):
+        self.store.set_style(key, value)
+        self.restart_btn.add_css_class("suggested-action")
+        self.set_status('Saved. Load on "Restart visualizer" to apply.')
+
+    def _color(self, key, value):
+        if not self._loading:
+            self.store.set_style(key, value)
+
+    def _poll_colors(self):
+        """If the next-wallpaper changed the colours, update the buttons."""
+        if self.store.pending() or self.store._mtime() == self.store.style_mtime:
+            return GLib.SOURCE_CONTINUE
+        self.store.style_mtime = self.store._mtime()
+        fresh = read_kv(STYLE_FILE, STYLE_DEFAULTS)
+        self._loading = True
+        try:
+            for key, btn in (("color", self.color1), ("color2", self.color2)):
+                rgba = Gdk.RGBA()
+                if rgba.parse(fresh[key]):
+                    btn.set_rgba(rgba)
+                self.store.style[key] = fresh[key]
+        finally:
+            self._loading = False
+        return GLib.SOURCE_CONTINUE
+
+    def _tpl_toggled(self, cb, name):
+        if cb.get_active():
+            self._disabled.discard(name)
+        else:
+            self._disabled.add(name)
+        self.store.set_config("disabled_templates", ",".join(sorted(self._disabled)))
+
+    def _toggle_autostart(self, on):
+        try:
+            set_autostart(on)
+            self.set_status("Autostart " + ("enabled" if on else "disabled"))
+        except OSError as e:
+            self.set_status(f"Erro: {e}")
+
+    def _choose_folder(self):
+        title = "Pasta dos wallpapers"
+        if hasattr(Gtk, "FileDialog"):
+            dlg = Gtk.FileDialog()
+            dlg.set_title(title)
+
+            def done(d, res):
+                try:
+                    f = d.select_folder_finish(res)
+                except GLib.Error:
+                    return
+                if f:
+                    self.dir_entry.set_text(f.get_path())
+            dlg.select_folder(self, None, done)
+        else:
+            ch = Gtk.FileChooserNative.new(title, self, Gtk.FileChooserAction.SELECT_FOLDER,
+                                           "Escolher", "Cancelar")
+
+            def resp(d, r):
+                if r == Gtk.ResponseType.ACCEPT:
+                    self.dir_entry.set_text(d.get_file().get_path())
+            ch.connect("response", resp)
+            ch.show()
+            self._chooser = ch
+
+    def run_wallpaper(self, action):
+        exe = find_bin("next-wallpaper")
+        if not exe:
+            self.set_status("next-wallpaper not found.")
+            return
+        self.store.flush()
+        subprocess.Popen([exe, action], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.set_status({"next": "Changing to the next…", "prev": "Going back to the previous…",
+                         "reapply": "Applying the theme…"}.get(action, action))
+
+    def restart_visualizer(self):
+        exes = [(n, find_bin(n)) for n in ("cava-bar", "cava-nowplaying")]
+        exes = [(n, p) for n, p in exes if p]
+        if not exes:
+            self.set_status("cava-bar not found.")
+            return
+        self.store.flush()
+        for n, _p in exes:
+            subprocess.run(["pkill", "-f", n + "$"])
+
+        def start():
+            for _n, exe in exes:
+                subprocess.Popen([exe], start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return GLib.SOURCE_REMOVE
+        GLib.timeout_add(700, start)
+        self.restart_btn.remove_css_class("suggested-action")
+        self.set_status("Visualizador reiniciado.")
+
+    def _on_close(self, *_):
+        self.store.flush()
+        return False
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="local.cavabar.settings")
+
+    def do_activate(self):
+        win = self.props.active_window or SettingsWindow(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

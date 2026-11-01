@@ -1,0 +1,12 @@
+[config]
+
+# Terminal kitty: adiciona "include colors.conf" ao kitty.conf
+[templates.kitty]
+input_path  = "~/.config/matugen/templates/kitty.conf"
+output_path = "~/.config/kitty/colors.conf"
+post_hook   = "pkill -USR1 kitty"
+
+# Variáveis CSS genéricas (waybar, GTK, etc.): faz @import deste ficheiro
+[templates.css]
+input_path  = "~/.config/matugen/templates/colors.css"
+output_path = "~/.config/cava-bar-theme/colors.css"

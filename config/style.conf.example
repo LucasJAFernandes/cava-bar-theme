@@ -1,0 +1,9 @@
+style=rounded
+color=#FF0000
+color2=#FF0000
+gradient=false
+opacity=0.85
+gap=4
+height=180
+bars=64
+silence=2

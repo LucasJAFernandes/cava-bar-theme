@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+# next-wallpaper: muda o wallpaper, gera o tema (matugen) e atualiza a cor do cava-bar.
+#
+# Uso: next-wallpaper [next|prev|random|restore|reapply]
+#   next      next (or random if order=random)     [default]
+#   prev      anterior
+#   random    a random one
+#   restore   reapply the current one (use on startup; does not generate theme)
+#   reapply   reapply the current one and generate the theme again
+#
+# Options: ~/.config/cava-bar-theme/config (or the cava-bar-settings window).
+# Environment variables (WALLPAPER_DIR, WALLPAPER_MODE, WALLPAPER_BACKEND)
+# take precedence over the file.
+
+CONFIG="${CAVA_THEME_CONFIG:-$HOME/.config/cava-bar-theme/config}"
+STYLE="${CAVA_BAR_STYLE:-$HOME/.config/cava-bar/style.conf}"
+STATE="$HOME/.cache/current-wallpaper"
+CACHE="$HOME/.cache/cava-bar-theme"
+COSMIC_CFG="$HOME/.config/cosmic/com.system76.CosmicBackground/v1"
+MATUGEN_CFG="$HOME/.config/matugen/config.toml"
+
+# ------------------------------------------------------------- utilidades --
+cfg() { # cfg CHAVE VALOR_POR_DEFEITO
+  local v
+  v=$(grep -m1 -E "^[[:space:]]*$1[[:space:]]*=" "$CONFIG" 2>/dev/null \
+      | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]+$//; s/^"(.*)"$/\1/')
+  echo "${v:-$2}"
+}
+
+is_true() { case "${1,,}" in 1|true|on|yes) return 0 ;; *) return 1 ;; esac; }
+
+MUSIC_HEX=""
+
+music_color() {
+  local url art IM avg
+  MUSIC_HEX=""
+  url=$(playerctl metadata mpris:artUrl 2>/dev/null) || return 1
+  [[ -z $url ]] && return 1
+  art="$CACHE/music-art-$(printf '%s' "$url" | md5sum | cut -c1-8).png"
+  if [[ $url == file://* ]]; then
+    [[ -f $url ]] || return 1
+    cp "$url" "$art"
+  elif command -v curl >/dev/null 2>&1; then
+    curl -sf --max-time 6 "$url" -o "$art" 2>/dev/null || return 1
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$art" "$url" 2>/dev/null || return 1
+  else
+    return 1
+  fi
+  IM=""
+  command -v magick >/dev/null 2>&1 && IM=magick
+  [[ -z $IM ]] && command -v convert >/dev/null 2>&1 && IM=convert
+  [[ -n $IM ]] || return 1
+  avg=$($IM "$art" -alpha off -resize 64x64! -modulate 100,200 -resize 1x1! -format '%[hex:u.p{0,0}]' info: 2>/dev/null | cut -c1-6)
+  if [[ -n $avg ]]; then
+    MUSIC_HEX="#$avg"
+  fi
+}
+notify() { command -v notify-send >/dev/null && notify-send -t 1500 "Wallpaper" "$1"; return 0; }
+
+set_kv() { # set_kv FICHEIRO CHAVE VALOR
+  local f=$1 k=$2 v=$3
+  mkdir -p "$(dirname "$f")"; touch "$f"
+  if grep -qE "^[[:space:]]*$k[[:space:]]*=" "$f"; then
+    sed -i -E "s|^[[:space:]]*$k[[:space:]]*=.*|$k=$v|" "$f"
+  else
+    echo "$k=$v" >> "$f"
+  fi
+}
+
+on_battery() { # true if there is an energy source and none is plugged in
+  local d mains=0 online=0
+  for d in /sys/class/power_supply/*; do
+    [[ $(cat "$d/type" 2>/dev/null) == Mains ]] || continue
+    mains=1
+    [[ $(cat "$d/online" 2>/dev/null) == 1 ]] && online=1
+  done
+  (( mains == 1 && online == 0 ))
+}
+
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ------------------------------------------------------------ options -------
+DIR="${WALLPAPER_DIR:-$(cfg wallpaper_dir "$HOME/Pictures/Wallpapers")}"
+DIR="${DIR/#\~/$HOME}"
+MODE="${WALLPAPER_MODE:-$(cfg mode dark)}"
+ORDER="$(cfg order sequential)"
+THEME="$(cfg theme on)"
+COLOR_MODE="$(cfg color_mode auto)"
+CONTRAST="$(cfg contrast high)"
+ANIMATED="$(cfg animated mpvpaper)"
+PAUSE_BAT="$(cfg pause_on_battery true)"
+DISABLED=",$(cfg disabled_templates ''),"
+
+action="${1:-next}"
+case $action in
+  next)            step=1 ;;
+  prev)            step=-1 ;;
+  random)          step=rand ;;
+  restore|reapply) step=0 ;;
+  -h|--help|help)  usage; exit 0 ;;
+  *) echo "Argumento desconhecido: $action" >&2; usage >&2; exit 2 ;;
+esac
+[[ $action == next && ${ORDER,,} == random ]] && step=rand
+
+# ------------------------------------------------------- escolher imagem ---
+mapfile -t imgs < <(find "$DIR" -type f \( \
+    -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \
+    -o -iname '*.gif' -o -iname '*.webm' -o -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.mov' \
+  \) 2>/dev/null | sort -V)
+n=${#imgs[@]}
+if (( n == 0 )); then
+  notify "Sem imagens em $DIR"
+  echo "Sem imagens em $DIR" >&2
+  exit 1
+fi
+
+cur=$(cat "$STATE" 2>/dev/null)
+idx=-1
+for i in "${!imgs[@]}"; do
+  [[ ${imgs[$i]} == "$cur" ]] && { idx=$i; break; }
+done
+
+if (( idx < 0 )); then
+  next_idx=0
+elif [[ $step == rand ]]; then
+  next_idx=$(( RANDOM % n ))
+  if (( n > 1 )); then
+    while (( next_idx == idx )); do next_idx=$(( RANDOM % n )); done
+  fi
+else
+  next_idx=$(( (idx + step + n) % n ))
+fi
+img=${imgs[$next_idx]}
+mkdir -p "$(dirname "$STATE")" "$CACHE"
+echo "$img" > "$STATE"
+
+ext="${img##*.}"; ext="${ext,,}"
+is_anim=0
+case $ext in gif|webm|mp4|mkv|mov) is_anim=1 ;; esac
+
+# ------------------------------------------------------------- backend -----
+backend="${WALLPAPER_BACKEND:-$(cfg backend auto)}"
+if [[ $backend == auto ]]; then
+  case "${XDG_CURRENT_DESKTOP,,}" in
+    *cosmic*) backend=cosmic ;;
+    *gnome*)  backend=gnome ;;
+    *)
+      if pgrep -x swww-daemon >/dev/null; then backend=swww
+      elif pgrep -x hyprpaper >/dev/null; then backend=hyprpaper
+      else backend=swaybg; fi ;;
+  esac
+fi
+
+apply_static() { # apply_static FICHEIRO
+  local f=$1
+  case $backend in
+    cosmic)
+      mkdir -p "$COSMIC_CFG"
+      cat > "$COSMIC_CFG/all" <<EOF
+(
+    output: "all",
+    source: Path("$f"),
+    filter_by_theme: false,
+    rotation_frequency: 3600,
+    filter_method: Lanczos,
+    scaling_mode: Zoom,
+    sampling_method: Alphanumeric,
+)
+EOF
+      echo true > "$COSMIC_CFG/same-on-all" ;;
+    swww)      swww img "$f" --transition-type any --transition-duration 1.2 ;;
+    hyprpaper) hyprctl hyprpaper preload "$f" >/dev/null; hyprctl hyprpaper wallpaper ",$f" >/dev/null ;;
+    swaybg)    pkill -x swaybg; setsid -f swaybg -i "$f" -m fill >/dev/null 2>&1 ;;
+    gnome)
+      gsettings set org.gnome.desktop.background picture-uri "file://$f"
+      gsettings set org.gnome.desktop.background picture-uri-dark "file://$f" ;;
+    none)      : ;;
+    *) echo "Backend desconhecido: $backend" >&2 ;;
+  esac
+}
+
+extract_frame() { # extract_frame FICHEIRO  -> escreve $frame
+  rm -f "$frame"
+  if [[ ${1,,} == *.gif ]] && command -v magick >/dev/null; then
+    magick "$1[0]" "$frame" 2>/dev/null
+  elif [[ ${1,,} == *.gif ]] && command -v convert >/dev/null; then
+    convert "$1[0]" "$frame" 2>/dev/null
+  elif command -v ffmpeg >/dev/null; then
+    ffmpeg -y -loglevel error -i "$1" -frames:v 1 "$frame" 2>/dev/null
+  fi
+  [[ -s $frame ]]
+}
+
+# ------------------------------------------------- aplicar o wallpaper -----
+pkill -x mpvpaper 2>/dev/null
+
+still="$img"      # static image used for the theme and as the wallpaper base
+motion=0
+if (( is_anim )); then
+  frame="$CACHE/frame-$(basename "$img" | md5sum | cut -c1-10).png"
+  if extract_frame "$img"; then still="$frame"; else still=""; fi
+
+  want=1
+  [[ ${ANIMATED,,} == frame ]] && want=0
+  if (( want )) && is_true "$PAUSE_BAT" && on_battery; then want=0; fi
+
+  if (( want )); then
+    if [[ $backend == swww && $ext == gif ]]; then
+      still="$img"   # o swww anima GIFs sozinho
+    elif command -v mpvpaper >/dev/null && [[ $backend != gnome ]]; then
+      motion=1
+    else
+      notify "No mpvpaper: using only the 1st frame"
+    fi
+  fi
+fi
+
+apply_static "${still:-$img}"
+if (( motion )); then
+  setsid -f mpvpaper -o "no-audio loop-file=inf hwdec=auto" '*' "$img" >/dev/null 2>&1
+fi
+
+[[ $action == restore ]] && exit 0
+
+# ------------------------------------------------------------- tema --------
+JQ_PICK='def pick(n): [ .colors[$m][n]?, .colors[n][$m]?, .colors[n][$m].color?, .colors[n].default.color? ] | map(select(type=="string")) | .[0] // empty;'
+
+run_matugen() { # run_matugen IMAGEM  (gera os ficheiros dos templates ativos)
+  local src=$1 tmp=""
+  local args=()
+  if [[ $DISABLED != ",," && -f $MATUGEN_CFG ]]; then
+    tmp=$(mktemp --suffix=.toml)
+    awk -v dis="$DISABLED" '
+      /^\[/ { skip = 0
+              if (match($0, /^\[templates\.[^]]+\]/)) {
+                name = substr($0, 12, RLENGTH - 12)
+                if (index(dis, "," name ",")) skip = 1 } }
+      !skip { print }' "$MATUGEN_CFG" > "$tmp"
+    args=(--config "$tmp")
+  fi
+  matugen "${args[@]}" image "$src" --mode "$MODE" >/dev/null 2>&1 \
+    || matugen image "$src" --mode "$MODE" >/dev/null 2>&1
+  [[ -n $tmp ]] && rm -f "$tmp"
+  return 0
+}
+
+run_matugen_color() { # run_matugen_color HEX  (tema do sistema com base na cor das barras)
+  local hex=$1 tmp=""
+  local args=()
+  [[ $hex == \#* ]] || return 0
+  if [[ $DISABLED != ",," && -f $MATUGEN_CFG ]]; then
+    tmp=$(mktemp --suffix=.toml)
+    awk -v dis="$DISABLED" '
+      /^\[/ { skip = 0
+              if (match($0, /^\[templates\.[^]]+\]/)) {
+                name = substr($0, 12, RLENGTH - 12)
+                if (index(dis, "," name ",")) skip = 1 } }
+      !skip { print }' "$MATUGEN_CFG" > "$tmp"
+    args=(--config "$tmp")
+  fi
+  matugen "${args[@]}" color hex "$hex" --mode "$MODE" >/dev/null 2>&1 \
+    || matugen color hex "$hex" --mode "$MODE" >/dev/null 2>&1
+  [[ -n $tmp ]] && rm -f "$tmp"
+  return 0
+}
+
+hex=""; hex2=""
+if [[ -n $still ]]; then
+  if [[ ${COLOR_MODE,,} == music ]]; then
+    music_color
+    if [[ -n $MUSIC_HEX ]]; then
+      hex=$MUSIC_HEX
+      hex2=$MUSIC_HEX
+    fi
+  elif [[ ${COLOR_MODE,,} == fixed ]]; then
+    fc=$(grep -m1 -E "^[[:space:]]*color[[:space:]]*=" "$STYLE" 2>/dev/null | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]+$//; s/^"(.*)"$/\1/')
+    if [[ $fc == \#* ]]; then
+      hex=$fc
+      fc2=$(grep -m1 -E "^[[:space:]]*color2[[:space:]]*=" "$STYLE" 2>/dev/null | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]+$//; s/^"(.*)"$/\1/')
+      [[ $fc2 == \#* ]] && hex2=$fc2 || hex2=$hex
+    elif command -v matugen >/dev/null; then
+      json=$(matugen image "$still" --mode "$MODE" --dry-run --json hex 2>/dev/null)
+      hex=$(jq -r --arg m "$MODE" "$JQ_PICK"' pick("primary")' <<<"$json" 2>/dev/null)
+      hex2=$(jq -r --arg m "$MODE" "$JQ_PICK"' pick("tertiary")' <<<"$json" 2>/dev/null)
+    fi
+  elif command -v matugen >/dev/null; then
+    # system theme is generated from the final bar colour below
+    json=$(matugen image "$still" --mode "$MODE" --dry-run --json hex 2>/dev/null)
+    hex=$(jq -r --arg m "$MODE" "$JQ_PICK"' pick("primary")' <<<"$json" 2>/dev/null)
+    hex2=$(jq -r --arg m "$MODE" "$JQ_PICK"' pick("tertiary")' <<<"$json" 2>/dev/null)
+  fi
+  # alternative without matugen: average colour of the image, increased saturation
+  if [[ $hex != \#* ]]; then
+    IM=""
+    command -v magick >/dev/null && IM=magick
+    [[ -z $IM ]] && command -v convert >/dev/null && IM=convert
+    if [[ -n $IM ]]; then
+      avg=$($IM "${still}[0]" -alpha off -resize 64x64! -modulate 100,200 -resize 1x1! \
+            -format '%[hex:u.p{0,0}]' info: 2>/dev/null | cut -c1-6)
+      [[ -n $avg ]] && hex="#$avg"
+    fi
+  fi
+fi
+
+# ------------------------------------------------------------- contraste ----
+# Se o matugen (ou fallback) gerou uma cor, garante que ela tem bom contraste
+# com o wallpaper. Um wallpaper escuro (ex.: preto) produce uma cor escura,
+# and cava-bar draws with it, making it nearly invisible. We force the colour to be
+# "legible": if the original colour is dark (luminance < 128), invert RGB
+# channels RGB; if clear, keep or slightly reduce. This ensures
+# that the bars are always visible regardless of the wallpaper.
+calc_contrast_color() {
+  # Garante boa legibilidade das barras do cava-bar em relacao ao wallpaper.
+  # Se a cor for muito escura (luminancia < 128) inverte RGB; se for clara,
+  # desvaloriza um pouco. Assim as barras sao sempre visiveis.
+  local hex="$1" hex_no_hash r g b lum out
+  hex="${hex#\#}"
+  hex_no_hash="${hex,,}"
+  r=$((16#${hex_no_hash:0:2}))
+  g=$((16#${hex_no_hash:2:2}))
+  b=$((16#${hex_no_hash:4:2}))
+  lum=$(( (r * 299 + g * 587 + b * 114) / 1000 ))
+  if (( lum < 128 )); then
+    out=$(printf '#%02X%02X%02X' $((255 - r)) $((255 - g)) $((255 - b)))
+  else
+    out=$(printf '#%02X%02X%02X' $((r / 2)) $((g / 2)) $((b / 2)))
+  fi
+  echo "$out"
+}
+
+if [[ ${COLOR_MODE,,} == auto && $hex == \#* ]]; then
+  [[ $hex2 == \#* ]] || hex2="$hex"
+  if [[ ${CONTRAST,,} == high ]]; then
+    hex=$(calc_contrast_color "$hex")
+    hex2=$(calc_contrast_color "$hex2")
+  fi
+  set_kv "$STYLE" color "$hex"
+  set_kv "$STYLE" color2 "$hex2"
+fi
+
+# System colour follows the colour of the bars (auto/music/fixed).
+bar_color="$hex"
+if [[ ${COLOR_MODE,,} == music && -n ${MUSIC_HEX:-} ]]; then
+  bar_color="$MUSIC_HEX"
+fi
+if [[ ${COLOR_MODE,,} == fixed ]]; then
+  fc=$(grep -m1 -E "^[[:space:]]*color[[:space:]]*=" "$STYLE" 2>/dev/null | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]+$//; s/^"(.*)"$/\1/')
+  [[ $fc == \#* ]] && bar_color="$fc"
+fi
+if is_true "$THEME" && command -v matugen >/dev/null && [[ $bar_color == \#* ]]; then
+  run_matugen_color "$bar_color"
+fi
+
+notify "$(basename "$img")"

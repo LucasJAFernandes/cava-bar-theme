@@ -1,0 +1,7 @@
+{
+  "uuid": "cava-bar@local",
+  "name": "Cava Bar",
+  "description": "Audio visualizer overlay for cava-bar-theme",
+  "version": 1,
+  "shell-version": ["45", "46", "47", "48", "49"]
+}

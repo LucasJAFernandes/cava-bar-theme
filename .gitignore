@@ -1,0 +1,27 @@
+# Python cache and local tooling
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime state and generated theme output
+.cache/
+colors.css
+
+# User-specific editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local demo/export files
+*.mp4
+*.webm
+
+# Distribution artifacts
+dist/
+packaging/cava-bar-theme-*.tar.gz

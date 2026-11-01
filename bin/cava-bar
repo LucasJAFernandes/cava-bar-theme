@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""cava-bar: on-screen audio visualizer (GTK4 + layer-shell + cava).
+
+Reads the options from ~/.config/cava-bar/style.conf (reloaded every second,
+except 'height' and 'bars' which only apply on restart).
+"""
+import os, sys, glob, subprocess, threading, time, atexit, math, re, signal
+
+if "CAVABAR_LOADED" not in os.environ:
+    libs = glob.glob("/usr/local/lib/**/libgtk4-layer-shell.so", recursive=True)
+    env = dict(os.environ, CAVABAR_LOADED="1")
+    if libs:
+        env["LD_PRELOAD"] = libs[0]
+    tl = glob.glob("/usr/local/lib/**/girepository-1.0", recursive=True)
+    if tl:
+        env["GI_TYPELIB_PATH"] = tl[0] + ":" + env.get("GI_TYPELIB_PATH", "")
+    os.execve(sys.executable, [sys.executable] + sys.argv, env)
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gtk, GLib, Gtk4LayerShell as LS
+
+try:
+    import cairo
+except Exception:  # if pycairo is missing, disable the gradient
+    cairo = None
+
+THRESHOLD = 1
+CONFIG = os.path.expanduser("~/.config/cava-bar/config")
+STYLE_FILE = os.path.expanduser("~/.config/cava-bar/style.conf")
+
+DEFAULT_CAVA_CONFIG = """[general]
+bars = 64
+framerate = 60
+
+[output]
+method = raw
+raw_target = /dev/stdout
+data_format = ascii
+ascii_max_range = 100
+bar_delimiter = 59
+frame_delimiter = 10
+"""
+
+cava_procs = []
+settings = {
+    "style": "rounded",
+    "color": "#FF0000",
+    "color2": "#FF0000",
+    "gradient": "false",
+    "opacity": "0.85",
+    "gap": "4",
+    "height": "180",
+    "bars": "64",
+    "silence": "2",
+}
+style_mtime = 0.0
+values = []
+last_sound = 0.0
+
+
+# ---------------------------------------------------------------- settings --
+def load_settings():
+    global style_mtime
+    try:
+        m = os.path.getmtime(STYLE_FILE)
+        if m == style_mtime:
+            return False
+        style_mtime = m
+        with open(STYLE_FILE) as f:
+            for line in f:
+                s = line.strip()
+                if "=" in s and not s.startswith("#"):
+                    k, v = s.split("=", 1)
+                    settings[k.strip()] = v.strip()
+        return True
+    except Exception:
+        return False
+
+
+def get_float(key, default, lo, hi):
+    try:
+        return min(hi, max(lo, float(settings.get(key, default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_int(key, default, lo, hi):
+    return int(get_float(key, default, lo, hi))
+
+
+def get_bool(key, default=False):
+    v = str(settings.get(key, default)).strip().lower()
+    return v in ("1", "true", "on", "yes")
+
+
+def parse_hex(c, default):
+    c = (c or "").strip().lstrip("#")
+    try:
+        return tuple(int(c[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    except Exception:
+        return default
+
+
+def get_color():
+    r, g, b = parse_hex(settings.get("color"), (1.0, 0.0, 0.0))
+    return r, g, b, get_float("opacity", 0.85, 0.0, 1.0)
+
+
+def get_gap():
+    return get_float("gap", 4.0, 0.0, 100.0)
+
+
+def set_paint(cr, h, alpha_mul=1.0):
+    """Define the drawing colour: solid or vertical gradient (color -> color2)."""
+    r, g, b, a = get_color()
+    a *= alpha_mul
+    if cairo is not None and get_bool("gradient"):
+        r2, g2, b2 = parse_hex(settings.get("color2"), (r, g, b))
+        grad = cairo.LinearGradient(0, h, 0, 0)  # de baixo (color) para cima (color2)
+        grad.add_color_stop_rgba(0, r, g, b, a)
+        grad.add_color_stop_rgba(1, r2, g2, b2, a)
+        cr.set_source(grad)
+    else:
+        cr.set_source_rgba(r, g, b, a)
+
+
+# ----------------------------------------------------------------- drawing --
+def rounded_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def curve_through(cr, pts):
+    # Catmull-Rom -> bezier, assume current point is pts[0]
+    n = len(pts)
+    for i in range(n - 1):
+        p0 = pts[max(i - 1, 0)]
+        p1 = pts[i]
+        p2 = pts[i + 1]
+        p3 = pts[min(i + 2, n - 1)]
+        c1 = (p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6)
+        c2 = (p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6)
+        cr.curve_to(c1[0], c1[1], c2[0], c2[1], p2[0], p2[1])
+
+
+def draw(area, cr, w, h):
+    n = len(values)
+    if not n:
+        return
+    gap = get_gap()
+    style = settings.get("style", "rounded")
+    bw = w / n
+
+    if style == "bars":
+        set_paint(cr, h)
+        for i, v in enumerate(values):
+            bh = max(2, v / 100.0 * h)
+            cr.rectangle(i * bw + gap / 2, h - bh, max(1, bw - gap), bh)
+        cr.fill()
+
+    elif style == "rounded":
+        set_paint(cr, h)
+        width = max(2, bw - gap)
+        rad = width / 2
+        for i, v in enumerate(values):
+            bh = max(width, v / 100.0 * h)
+            rounded_rect(cr, i * bw + gap / 2, h - bh, width, bh, rad)
+        cr.fill()
+
+    elif style in ("wave", "line"):
+        pts = [((i + 0.5) * bw, h - max(2, v / 100.0 * h * 0.95))
+               for i, v in enumerate(values)]
+        if len(pts) < 2:
+            return
+        if style == "wave":
+            cr.move_to(0, h)
+            cr.line_to(*pts[0])
+            curve_through(cr, pts)
+            cr.line_to(w, h)
+            cr.close_path()
+            set_paint(cr, h, 0.35)
+            cr.fill()
+        cr.move_to(*pts[0])
+        curve_through(cr, pts)
+        set_paint(cr, h)
+        cr.set_line_width(3)
+        cr.set_line_cap(1)
+        cr.stroke()
+
+    elif style == "dots":
+        set_paint(cr, h)
+        size = max(4, bw - gap)
+        step = size + gap
+        for i, v in enumerate(values):
+            count = int(v / 100.0 * h / step)
+            cx = i * bw + bw / 2
+            for j in range(max(count, 1)):
+                cr.arc(cx, h - size / 2 - j * step, size / 2, 0, 2 * math.pi)
+                cr.new_sub_path()
+        cr.fill()
+
+
+# -------------------------------------------------------------------- cava --
+def build_cava_config(source):
+    try:
+        with open(CONFIG) as f:
+            text = f.read()
+    except OSError:
+        text = DEFAULT_CAVA_CONFIG
+    n = get_int("bars", 64, 4, 512)
+    text = re.sub(r"(?im)^\s*bars\s*=.*$", "", text)
+    if re.search(r"(?im)^\[general\]\s*$", text):
+        text = re.sub(r"(?im)^\[general\]\s*$", f"[general]\nbars = {n}", text, count=1)
+    else:
+        text = f"[general]\nbars = {n}\n" + text
+    if source:
+        text += f"\n[input]\nmethod = pulse\nsource = {source}\n"
+    return text
+
+
+def on_activate(app):
+    load_settings()
+    height = get_int("height", 180, 20, 1000)
+
+    win = Gtk.ApplicationWindow(application=app)
+    win.set_default_size(0, height)
+    win.set_decorated(False)
+
+    css = Gtk.CssProvider()
+    css.load_from_data(b"window { background: transparent; }")
+    Gtk.StyleContext.add_provider_for_display(
+        win.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    LS.init_for_window(win)
+    LS.set_layer(win, LS.Layer.BOTTOM)
+    LS.set_namespace(win, "cava-bar")
+    for edge in (LS.Edge.LEFT, LS.Edge.RIGHT, LS.Edge.BOTTOM):
+        LS.set_anchor(win, edge, True)
+    LS.set_exclusive_zone(win, -1)
+    LS.set_keyboard_mode(win, LS.KeyboardMode.NONE)
+
+    area = Gtk.DrawingArea()
+    area.set_content_height(height)
+    area.set_draw_func(draw)
+    win.set_child(area)
+
+    def on_map(_w):
+        try:
+            win.get_surface().set_input_region(cairo.Region())
+        except Exception:
+            pass
+    win.connect("map", on_map)
+
+    def update(vals):
+        global values, last_sound
+        now = time.monotonic()
+        if vals and max(vals) > THRESHOLD:
+            last_sound = now
+        if now - last_sound > get_float("silence", 2.0, 0.2, 120.0):
+            if values:
+                values = []
+                area.queue_draw()
+            return False
+        values = vals
+        area.queue_draw()
+        return False
+
+    def reader():
+        try:
+            out = subprocess.run(["pactl", "list", "short", "sources"],
+                                 capture_output=True, text=True).stdout
+        except OSError:
+            out = ""
+        monitors = [l.split("\t")[1] for l in out.splitlines()
+                    if ".monitor" in l and len(l.split("\t")) > 1]
+        latest = {}
+        lock = threading.Lock()
+        last_push = [0.0]
+
+        def run(idx, source):
+            cfg = f"/tmp/cava-bar-{os.getuid()}-{idx}.conf"
+            with open(cfg, "w") as f:
+                f.write(build_cava_config(source))
+            p = subprocess.Popen(["cava", "-p", cfg],
+                                 stdout=subprocess.PIPE, text=True)
+            cava_procs.append(p)
+            for line in p.stdout:
+                try:
+                    vals = [int(x) for x in line.strip().split(";") if x]
+                except ValueError:
+                    continue
+                with lock:
+                    latest[idx] = vals
+                    now = time.monotonic()
+                    if now - last_push[0] < 0.015:
+                        continue
+                    last_push[0] = now
+                    arrays = list(latest.values())
+                n = min(len(a) for a in arrays)
+                merged = [max(a[i] for a in arrays) for i in range(n)]
+                if max(merged, default=0) > THRESHOLD or values:
+                    GLib.idle_add(update, merged)
+
+        sources = monitors or [None]
+        for i, s in enumerate(sources):
+            threading.Thread(target=run, args=(i, s), daemon=True).start()
+
+    def reload_settings():
+        if load_settings():
+            area.queue_draw()
+        return True
+
+    def on_term(*_):
+        cleanup()
+        app.quit()
+        return GLib.SOURCE_REMOVE
+
+    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, on_term)
+    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, on_term)
+
+    GLib.timeout_add_seconds(1, reload_settings)
+    threading.Thread(target=reader, daemon=True).start()
+    win.present()
+    app.hold()
+
+
+def cleanup():
+    for p in cava_procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
+atexit.register(cleanup)
+
+app = Gtk.Application(application_id="local.cavabar")
+app.connect("activate", on_activate)
+app.run(None)

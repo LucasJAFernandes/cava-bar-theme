@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""cava-nowplaying: GTK4 now playing widget (layer-shell + playerctl).
+
+Integrated with cava-bar-theme:
+  - progress bar colour = 'color' in ~/.config/cava-bar/style.conf
+  - show/hide = 'show_audio_status' in ~/.config/cava-bar-theme/config
+  - 'player' (optional) in config fixes a music player (ex: spotify)
+All is reloaded every second, without restarting.
+"""
+import os, sys, glob, subprocess, threading, hashlib, time, atexit
+import urllib.request, urllib.parse
+import shutil
+
+if "NOWPLAYING_LOADED" not in os.environ:
+    libs = glob.glob("/usr/local/lib/**/libgtk4-layer-shell.so", recursive=True)
+    env = dict(os.environ, NOWPLAYING_LOADED="1")
+    if libs:
+        env["LD_PRELOAD"] = libs[0]
+    tl = glob.glob("/usr/local/lib/**/girepository-1.0", recursive=True)
+    if tl:
+        env["GI_TYPELIB_PATH"] = tl[0] + ":" + env.get("GI_TYPELIB_PATH", "")
+    os.execve(sys.executable, [sys.executable] + sys.argv, env)
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gtk, Gdk, GLib, Pango, Gtk4LayerShell as LS
+
+try:
+    import cairo
+except Exception:
+    cairo = None
+
+MARGIN_TOP = 50
+MARGIN_RIGHT = 24
+ART_SIZE = 220
+POLL_SECONDS = 1
+
+STYLE_FILE = os.path.expanduser("~/.config/cava-bar/style.conf")
+CONFIG_FILE = os.path.expanduser("~/.config/cava-bar-theme/config")
+MATUGEN_CFG = os.path.expanduser("~/.config/matugen/config.toml")
+
+state = {"art": None, "show": True, "player": "", "color": "#FF0000", "theme": True, "mode": "dark", "disabled_templates": ""}
+_mtimes = {}
+
+
+# ---------------------------------------------------------------- config ---
+def read_kv(path):
+    data = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                s = line.strip()
+                if s and not s.startswith("#") and "=" in s:
+                    k, v = s.split("=", 1)
+                    data[k.strip()] = v.strip().strip('"')
+    except OSError:
+        pass
+    return data
+
+
+def changed(path):
+    try:
+        m = os.path.getmtime(path)
+    except OSError:
+        m = 0.0
+    if _mtimes.get(path) == m:
+        return False
+    _mtimes[path] = m
+    return True
+
+
+def refresh_settings():
+    """Reload the files only if they changed. Returns True if something changed."""
+    dirty = False
+    if changed(STYLE_FILE):
+        c = read_kv(STYLE_FILE).get("color", "")
+        if c.startswith("#") and len(c) >= 7:
+            state["color"] = c[:7].upper()
+        dirty = True
+    if changed(CONFIG_FILE):
+        cfg = read_kv(CONFIG_FILE)
+        state["show"] = cfg.get("show_audio_status", "true").lower() in ("1", "true", "on", "yes")
+        state["player"] = cfg.get("player", "").strip()
+        state["color_mode"] = cfg.get("color_mode", "auto")
+        state["theme"] = cfg.get("theme", "on").lower() in ("1", "true", "on", "yes")
+        state["mode"] = cfg.get("mode", "dark")
+        state["disabled_templates"] = cfg.get("disabled_templates", "")
+        dirty = True
+    return dirty
+
+
+# ------------------------------------------------------------------ utils --
+def fetch_art(url):
+    if not url:
+        return None
+    if url.startswith("file://"):
+        return urllib.parse.unquote(url[7:])
+    path = f"/tmp/cava-art-{hashlib.md5(url.encode()).hexdigest()}"
+    if not os.path.exists(path):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as r, open(path, "wb") as f:
+                f.write(r.read())
+        except Exception:
+            return None
+    return path
+
+
+def fmt_time(s):
+    s = max(0, int(s))
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def to_float(txt, div=1.0):
+    try:
+        return float(txt) / div
+    except (ValueError, TypeError):
+        return None
+
+
+CSS = """
+window {{ background: transparent; }}
+.np {{ opacity: 1; transition: opacity 450ms ease; }}
+.np.hidden {{ opacity: 0; }}
+.art {{ border-radius: 20px; box-shadow: 0 6px 24px rgba(0,0,0,0.55); }}
+.title {{ color: white; font-weight: 800; font-size: 20px; text-shadow: 0 2px 6px rgba(0,0,0,0.85); }}
+.artist {{ color: rgba(255,255,255,0.85); font-size: 14px; text-shadow: 0 2px 6px rgba(0,0,0,0.85); }}
+.time {{ color: rgba(255,255,255,0.85); font-size: 12px; font-feature-settings: "tnum"; text-shadow: 0 1px 4px rgba(0,0,0,0.85); }}
+progressbar > trough {{ min-height: 6px; border-radius: 3px; background: rgba(255,255,255,0.20); }}
+progressbar > trough > progress {{ min-height: 6px; border-radius: 3px; background: {color}; }}
+"""
+
+
+# -------------------------------------------------------------------- GTK --
+def on_activate(app):
+    refresh_settings()
+
+    def set_style_color(color):
+        path = STYLE_FILE
+        tmp = path + ".tmp"
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+        except OSError:
+            lines = []
+        out = []
+        wrote = False
+        for line in lines:
+            line_s = line.strip()
+            if line_s.startswith("#") or "=" not in line_s:
+                out.append(line)
+                continue
+            k = line_s.split("=", 1)[0].strip()
+            if k in ("color", "color2"):
+                out.append(f"{k}={color}\n")
+                wrote = True
+            else:
+                out.append(line)
+        if not wrote:
+            out.append(f"color={color}\n")
+            out.append(f"color2={color}\n")
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp, "w") as f:
+                f.writelines(out)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def art_color(url):
+        path = fetch_art(url)
+        if not path or not os.path.exists(path):
+            return None
+        if shutil.which("magick"):
+            im = ["magick"]
+        elif shutil.which("convert"):
+            im = ["convert"]
+        else:
+            return None
+        try:
+            # CORRECTION: the input file must be passed to ImageMagick.
+            # "[0]" uses only the first frame (GIF covers).
+            # Returns "R,G,B" in 0-255 (the %[hex:] gives 16 bits per channel in Q16 builds,
+            # o que produzia uma cor errada).
+            fx = ",".join(f"%[fx:int(255*p{{0,0}}.{c}+0.5)]" for c in "rgb")
+            proc = subprocess.run(
+                im + [path + "[0]", "-alpha", "off", "-resize", "64x64!",
+                      "-modulate", "100,200", "-resize", "1x1!",
+                      "-depth", "8", "-format", fx, "info:"],
+                capture_output=True, text=True, timeout=10,
+            )
+            out = proc.stdout.strip()
+            try:
+                r, g, b = (max(0, min(255, int(x))) for x in out.split(","))
+                return "#%02X%02X%02X" % (r, g, b)
+            except ValueError:
+                pass
+            if os.environ.get("CAVA_NP_DEBUG") == "1":
+                print(f"cava-nowplaying: magick produced no useful output: {out!r} {proc.stderr.strip()}",
+                      file=sys.stderr)
+        except Exception as e:
+            if os.environ.get("CAVA_NP_DEBUG") == "1":
+                print(f"cava-nowplaying: erro no magick: {e}", file=sys.stderr)
+        return None
+
+    def update_music_color(url, playing):
+        if state.get("color_mode") != "music":
+            return
+        if not playing:
+            return
+        color = art_color(url)
+        if color:
+            set_style_color(color)
+            if state.get("theme", True) and __import__("shutil").which("matugen"):
+                __import__("subprocess").Popen(["matugen", "color", "hex", color, "--mode", state.get("mode", "dark")], stdout=__import__("subprocess").DEVNULL, stderr=__import__("subprocess").DEVNULL)
+        else:
+            if os.environ.get("CAVA_NP_DEBUG") == "1":
+                print(f"cava-nowplaying: art_color returned None for url={url!r}", file=sys.stderr)
+
+    win = Gtk.ApplicationWindow(application=app)
+    win.set_decorated(False)
+
+    LS.init_for_window(win)
+    LS.set_layer(win, LS.Layer.BOTTOM)
+    LS.set_namespace(win, "cava-nowplaying")
+    LS.set_anchor(win, LS.Edge.TOP, True)
+    LS.set_anchor(win, LS.Edge.RIGHT, True)
+    LS.set_margin(win, LS.Edge.TOP, MARGIN_TOP)
+    LS.set_margin(win, LS.Edge.RIGHT, MARGIN_RIGHT)
+    LS.set_exclusive_zone(win, -1)
+    LS.set_keyboard_mode(win, LS.KeyboardMode.NONE)
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    box.add_css_class("np")
+    box.add_css_class("hidden")
+    box.set_size_request(ART_SIZE, -1)
+
+    pic = Gtk.Picture()
+    pic.set_content_fit(Gtk.ContentFit.COVER)
+    pic.set_can_shrink(True)
+
+    art_box = Gtk.ScrolledWindow()
+    art_box.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.NEVER)
+    art_box.set_size_request(ART_SIZE, ART_SIZE)
+    art_box.set_halign(Gtk.Align.CENTER)
+    art_box.set_valign(Gtk.Align.START)
+    art_box.set_overflow(Gtk.Overflow.HIDDEN)
+    art_box.set_child(pic)
+    art_box.add_css_class("art")
+
+    title = Gtk.Label(xalign=0.5)
+    title.add_css_class("title")
+    title.set_ellipsize(Pango.EllipsizeMode.END)
+    title.set_max_width_chars(20)
+    title.set_margin_top(10)
+
+    artist = Gtk.Label(xalign=0.5)
+    artist.add_css_class("artist")
+    artist.set_ellipsize(Pango.EllipsizeMode.END)
+    artist.set_max_width_chars(24)
+
+    bar = Gtk.ProgressBar()
+    bar.set_hexpand(True)
+    bar.set_valign(Gtk.Align.CENTER)
+
+    t_now = Gtk.Label(label="0:00")
+    t_now.add_css_class("time")
+    t_end = Gtk.Label(label="--:--")
+    t_end.add_css_class("time")
+
+    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    row.set_margin_top(8)
+    row.append(t_now)
+    row.append(bar)
+    row.append(t_end)
+
+    for w in (art_box, title, artist, row):
+        box.append(w)
+    win.set_child(box)
+
+    # --- CSS (cor vem do style.conf do cava-bar)
+    provider = Gtk.CssProvider()
+    Gtk.StyleContext.add_provider_for_display(
+        win.get_display(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def load_css():
+        css = CSS.format(color=state["color"])
+        try:
+            if hasattr(provider, "load_from_string"):
+                provider.load_from_string(css)
+            else:
+                provider.load_from_data(css.encode())
+        except Exception:
+            pass
+
+    load_css()
+
+    # --- o widget nunca apanha cliques
+    def on_map(_w):
+        try:
+            win.get_surface().set_input_region(cairo.Region())
+        except Exception:
+            pass
+    win.connect("map", on_map)
+
+    last = {"args": None}
+
+    def apply(playing, t, a, length, path, pos):
+        last["args"] = (playing, t, a, length, path, pos)
+        if not playing or not state["show"]:
+            box.add_css_class("hidden")
+            return False
+
+        title.set_text(t)
+        artist.set_text(a or "")
+
+        if path != state["art"]:
+            state["art"] = path
+            try:
+                pic.set_paintable(Gdk.Texture.new_from_filename(path) if path else None)
+            except Exception:
+                pic.set_paintable(None)
+
+        t_now.set_text(fmt_time(pos))
+        if length:
+            t_end.set_text(fmt_time(length))
+            bar.set_fraction(min(1.0, pos / length))
+        else:
+            t_end.set_text("--:--")
+            bar.set_fraction(0)
+        box.remove_css_class("hidden")
+        return False
+
+    def tick():
+        # Color / visibility changed? Reapply immediately, without waiting for the next poll.
+        if refresh_settings():
+            load_css()
+            if last["args"]:
+                apply(*last["args"])
+        return GLib.SOURCE_CONTINUE
+
+    GLib.timeout_add_seconds(1, tick)
+
+    # --- playerctl
+    def poll():
+        fmt = ("{{status}}|||{{title}}|||{{artist}}|||"
+               "{{mpris:length}}|||{{mpris:artUrl}}|||{{position}}")
+        art_cache = {}
+        est, last_key, last_t, last_url = 0.0, None, time.monotonic(), None
+        colored = None   # (url, color_mode) for which the colour has already been calculated
+
+        while True:
+            time.sleep(POLL_SECONDS)
+            now = time.monotonic()
+            dt, last_t = now - last_t, now
+
+            if not state["show"]:          # disabled: do not waste CPU
+                GLib.idle_add(apply, False, "", "", 0, None, 0)
+                continue
+
+            cmd = ["playerctl"]
+            if state["player"]:
+                cmd += ["-p", state["player"]]
+            cmd += ["metadata", "--format", fmt]
+
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True,
+                                     timeout=3).stdout.strip()
+            except FileNotFoundError:
+                if os.environ.get("CAVA_NP_DEBUG") == "1":
+                    print("cava-nowplaying: playerctl not installed", file=sys.stderr)
+                out = ""
+            except Exception:
+                out = ""
+
+            parts = out.split("|||")
+            if len(parts) < 6 or not parts[1]:
+                GLib.idle_add(apply, False, "", "", 0, None, 0)
+                continue
+
+            status, t, a, ln, url, ps = parts[:6]
+            playing = status == "Playing"
+            length = to_float(ln, 1_000_000) or 0.0
+            real = to_float(ps, 1_000_000)
+
+            key = (t, a, round(length))
+            if key != last_key or (last_url is not None and url != last_url):
+                last_key, est = key, 0.0
+                last_url = url
+            elif playing:
+                est += dt
+
+            # CORRECTION: calculate the colour as soon as the music starts playing,
+            # mesmo que tenha arrancado em pausa ou o modo tenha mudado depois.
+            # Runs in another thread so it never blocks widget updates.
+            if playing and (url, state.get("color_mode")) != colored:
+                colored = (url, state.get("color_mode"))
+                threading.Thread(target=update_music_color, args=(url, True),
+                                 daemon=True).start()
+
+            if real is not None and not (real == 0 and est > 3):
+                pos = est = real
+            else:
+                pos = est
+            if length:
+                pos = min(pos, length)
+
+            if url not in art_cache:
+                art_cache[url] = fetch_art(url)
+                if len(art_cache) > 20:
+                    art_cache.pop(next(iter(art_cache)))
+
+            GLib.idle_add(apply, playing, t, a, length, art_cache[url], pos)
+
+    def poll_forever():
+        # If the poll crashes for any reason, restart instead of dying silently
+        # (uma thread morta deixa o widget escondido para sempre).
+        while True:
+            try:
+                poll()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                time.sleep(2)
+
+    threading.Thread(target=poll_forever, daemon=True).start()
+    win.present()
+    app.hold()
+
+
+app = Gtk.Application(application_id="local.cavanowplaying")
+app.connect("activate", on_activate)
+app.run(None)
